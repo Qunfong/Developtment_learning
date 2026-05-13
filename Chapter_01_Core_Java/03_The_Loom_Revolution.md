@@ -353,6 +353,132 @@ Spring Boot 3.2 + Virtual Threads (Loom), same DB call:
 
 ---
 
+## Exercise Solutions
+
+<details>
+<summary>Exercise 1 — Work-stealing: why steal from the bottom (oldest)</summary>
+
+Each worker thread has a double-ended queue (deque). The worker itself pushes and pops from the **top** (LIFO — most recently forked tasks first, exploiting cache warmth and parent-child locality). Idle stealers take from the **bottom** (FIFO — oldest tasks).
+
+If stealers also took from the top, they would compete with the owner on the same end, requiring stronger synchronization (both ends need a CAS). Stealing from the bottom means stealer and owner operate on opposite ends — contention is rare and handled by a single CAS on the bottom index.
+
+Additionally, older tasks (at the bottom) tend to be larger-grained subtrees. Stealing a larger task gives the idle worker more work before it needs to steal again, reducing steal frequency and inter-thread traffic.
+
+**Staff-level phrasing:** "ForkJoinPool steals FIFO from the bottom so that stealer and owner operate on opposite ends of the deque — zero contention in the common case; older stolen tasks are larger-grained, reducing steal frequency."
+
+</details>
+
+<details>
+<summary>Exercise 2 — Virtual thread sleep: carrier behavior and stack storage</summary>
+
+When a virtual thread calls `Thread.sleep(1000)`:
+1. The virtual thread runtime detects this as a "yieldable" blocking operation.
+2. The virtual thread's stack frames (its continuation) are **serialized off the carrier thread stack** and stored as a heap-allocated `Continuation` object.
+3. The virtual thread is **unmounted** from its carrier thread.
+4. The carrier thread is **freed** to execute other virtual threads from the ForkJoinPool's work queue.
+5. After 1000ms, the scheduler reschedules the virtual thread — it is mounted onto a (possibly different) carrier thread, the continuation is reinstalled, and execution resumes.
+
+The carrier thread does NOT block. It returns to the pool immediately and can process other virtual threads during the sleep.
+
+**Staff-level phrasing:** "Virtual thread `sleep` serializes the continuation to heap, unmounts from the carrier, and frees the OS thread instantly — the carrier runs other work; on wake-up, the continuation is remounted, possibly on a different carrier."
+
+</details>
+
+<details>
+<summary>Exercise 3 — Static synchronized: wrong fix vs right fix</summary>
+
+**Wrong fix:** Simply removing `synchronized`. This eliminates the JMM visibility and atomicity guarantees provided by the monitor. If the method modifies shared state, you now have data races — threads can see stale values or partially updated state.
+
+**Right fix:** Replace `static synchronized` (which locks on the `Class` object) with an explicit `static final ReentrantLock`:
+
+```java
+private static final ReentrantLock lock = new ReentrantLock();
+
+static void safeMethod() {
+    lock.lock();
+    try {
+        // shared state manipulation
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+`ReentrantLock` does not pin virtual threads to their carrier because acquiring an uncontended lock is non-blocking, and even when contended, `ReentrantLock.lock()` uses a `LockSupport.park()` path that the virtual thread runtime intercepts and converts to an unmount.
+
+**JMM guarantee preserved:** `ReentrantLock` unlock happens-before the next lock — same visibility guarantee as `synchronized`. You must keep the lock/unlock structure to preserve this.
+
+**Staff-level phrasing:** "Replace `synchronized` with `ReentrantLock` — same happens-before guarantee, but `ReentrantLock` uses `LockSupport.park()` which the virtual thread runtime translates to a continuation unmount instead of carrier pinning."
+
+</details>
+
+<details>
+<summary>Exercise 4 — Coding challenge: timeout utility with StructuredTaskScope</summary>
+
+```java
+// Reference implementation (Java 21+, compilable standalone)
+import java.util.concurrent.*;
+import jdk.incubator.concurrent.*;
+
+public class TimeoutUtil {
+
+    public static <T> T timeout(Callable<T> task, java.time.Duration max)
+            throws InterruptedException, TimeoutException, Exception {
+
+        try (var scope = new StructuredTaskScope.ShutdownOnSuccess<T>()) {
+            StructuredTaskScope.Subtask<T> subtask = scope.fork(task);
+            scope.joinUntil(java.time.Instant.now().plus(max));
+
+            if (subtask.state() == StructuredTaskScope.Subtask.State.SUCCESS) {
+                return subtask.get();
+            } else {
+                throw new TimeoutException("Task did not complete within " + max);
+            }
+        }
+    }
+
+    // Tests
+    public static void main(String[] args) throws Exception {
+        // Task completes on time
+        String result = timeout(() -> "done", java.time.Duration.ofSeconds(1));
+        assert "done".equals(result) : "Expected 'done'";
+
+        // Task exceeds timeout
+        try {
+            timeout(() -> {
+                Thread.sleep(5000);
+                return "never";
+            }, java.time.Duration.ofMillis(100));
+            assert false : "Should have thrown TimeoutException";
+        } catch (TimeoutException e) {
+            System.out.println("TimeoutException thrown correctly: " + e.getMessage());
+        }
+        System.out.println("All assertions passed.");
+    }
+}
+```
+
+**Why this works:** `StructuredTaskScope.ShutdownOnSuccess` calls `scope.shutdown()` on the first successful result. `scope.joinUntil(deadline)` returns when either shutdown is triggered or the deadline is exceeded. After join, checking `subtask.state()` distinguishes success from timeout. The `try-with-resources` close guarantees the forked subtask is cancelled and its thread is interrupted if still running — clean lifecycle regardless of outcome.
+
+**Common mistake:** Using `CompletableFuture.supplyAsync(...).get(max, MILLISECONDS)` — this cancels the `Future` but does NOT stop the underlying thread; the task keeps running in the background, consuming resources. `StructuredTaskScope` guarantees the forked virtual thread receives an interrupt on close.
+
+</details>
+
+<details>
+<summary>Exercise 5 — ScopedValue vs ThreadLocal: the memory leak scenario</summary>
+
+With `ThreadLocal` and a thread pool: a virtual thread (or platform thread) in a pool completes its request but `threadLocal.remove()` is never called (common in framework code). The `Thread` object is reused for the next request, and the `ThreadLocal` map on that thread still holds the old value — it is never GC'd until the thread dies (which in a pool, may be never). With millions of virtual threads churning through a pool, old values accumulate.
+
+`ScopedValue` is **immutable and scope-bounded**: you bind it with `ScopedValue.where(key, value).run(() -> ...)`. When the lambda exits, the binding is automatically unbound — there is no `remove()` to forget, and the value is not stored in the thread object at all. It is stored in a per-scope frame that is released when the scope exits, regardless of which thread executes the code.
+
+Additionally, `ScopedValue` is inherited by child virtual threads forked within a `StructuredTaskScope` without copying — child threads read the same binding without allocating extra storage.
+
+**Staff-level phrasing:** "`ThreadLocal` leaks when `remove()` is skipped on pooled threads; `ScopedValue` is automatically unbound at scope exit because it's stored in the call frame, not the thread object — the leak scenario is structurally impossible."
+
+</details>
+
+---
+
 ## 9. Summary / Flashcard
 
 - **Virtual threads decouple task count from OS thread count**: 1M virtual threads cost ~1GB heap (1KB stacks) vs 1M platform threads = 1TB RAM; the carrier thread unmounts on I/O, reuses the OS thread for another virtual thread

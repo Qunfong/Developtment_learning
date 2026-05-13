@@ -425,6 +425,140 @@ TRADE-OFF:
 
 ---
 
+## Exercise Solutions
+
+<details>
+<summary>Exercise 1 — Lock-free vs wait-free: definition and Java examples</summary>
+
+**Lock-free:** Guarantees that *at least one thread* makes progress in a finite number of steps. Individual threads may starve (retry their CAS loop indefinitely) but the system as a whole always makes forward progress. A thread can be preempted and its CAS will fail, but some other thread will succeed.
+
+**Wait-free:** Guarantees that *every thread* completes its operation in a bounded number of steps, regardless of what other threads do. No thread can starve.
+
+Wait-free is strictly stronger than lock-free. All wait-free algorithms are lock-free, but not vice versa.
+
+**Java standard library examples:**
+- **Lock-free:** `ConcurrentLinkedQueue` — `offer()` and `poll()` use CAS retry loops; under high contention a thread may retry many times, but globally progress is always made
+- **Wait-free:** `AtomicInteger.get()` — a simple volatile read that completes in O(1) steps regardless of contention; no CAS, no retry, always terminates in one step
+
+**Staff-level phrasing:** "Lock-free = system progress guaranteed; wait-free = per-thread bounded-step guarantee — `ConcurrentLinkedQueue.offer()` is lock-free (CAS retry, individual threads may spin); `AtomicInteger.get()` is wait-free (volatile read, O(1) unconditional)."
+
+</details>
+
+<details>
+<summary>Exercise 2 — ABA problem: timeline and AtomicStampedReference fix</summary>
+
+**ABA timeline on a lock-free stack (`AtomicReference<Node>`):**
+```
+Initial stack: A → B → C
+Thread 1 reads head = A, about to CAS(A, B)
+Thread 1 is preempted.
+Thread 2 pops A, pops B (stack = C)
+Thread 2 pushes A back (stack = A → C, but B is freed/reused)
+Thread 1 resumes: CAS(A, B) SUCCEEDS (A is still head)
+Stack is now: B → C — but B was freed! Dangling pointer.
+```
+
+The CAS succeeded because the reference value matched, but the structure underneath had changed.
+
+**Fix with `AtomicStampedReference`:**
+```java
+AtomicStampedReference<Node> head = new AtomicStampedReference<>(nodeA, 0);
+
+// Pop:
+int[] stampHolder = new int[1];
+Node current = head.get(stampHolder);
+int stamp = stampHolder[0];
+// ... compute next ...
+head.compareAndSet(current, next, stamp, stamp + 1);  // fails if stamp changed
+```
+
+Each mutation increments the stamp. Thread 1's CAS now checks `(A, stamp=0)`. After Thread 2's operations, `stamp=2`. Thread 1's CAS fails because stamp 0 ≠ 2, forcing a retry with the correct current state.
+
+**Staff-level phrasing:** "ABA lets a CAS succeed on a structurally changed structure because reference equality alone can't distinguish 'same object returned' from 'never changed'; `AtomicStampedReference` pairs a version counter with the reference so the CAS fails on any intermediate modification even if the pointer looks the same."
+
+</details>
+
+<details>
+<summary>Exercise 3 — ConcurrentLinkedQueue: weakCompareAndSet vs compareAndSet</summary>
+
+In `ConcurrentLinkedQueue.offer()`, two CAS operations occur:
+1. **`node.next.compareAndSet(null, newNode)`** — links the new node into the queue. This MUST succeed exactly once per offer; using `compareAndSet` ensures that if two threads race, exactly one wins and the other retries from the top.
+2. **`tail.compareAndSet(t, newNode)`** — advances the tail pointer to the new node. This uses `weakCompareAndSet` (or a relaxed CAS).
+
+`weakCompareAndSet` may fail **spuriously** — it can return `false` even when the expected value matches. This is safe here because the algorithm is designed with a "lazy tail" — the tail is allowed to lag one step behind the actual last node. If the tail CAS fails spuriously, the next `offer()` call will advance the tail as part of its own operation (the "helping" pattern). The correctness invariant (a node is always linked before any tail update) is preserved by the `compareAndSet` on `node.next`. The tail CAS is a best-effort optimization, not a correctness requirement.
+
+**Staff-level phrasing:** "The `next` pointer CAS uses strong CAS because correct linking is a correctness invariant — one winner required; the `tail` CAS uses weak CAS because tail lag is intentional — a spurious failure is recovered by the next enqueue's helping step, so spurious failure is free."
+
+</details>
+
+<details>
+<summary>Exercise 4 — Coding challenge: OneTimeLatch with AtomicBoolean</summary>
+
+```java
+// Reference implementation (Java 21+, compilable standalone)
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class OneTimeLatch {
+    private final AtomicBoolean set = new AtomicBoolean(false);
+
+    /** Returns true if this call was the one that set it; false if already set. */
+    public boolean trySet() {
+        return set.compareAndSet(false, true);  // CAS: only one thread wins
+    }
+
+    public boolean isSet() {
+        return set.get();
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        var latch = new OneTimeLatch();
+        var successCount = new AtomicInteger(0);
+        int threadCount = 100;
+        var startLatch = new CountDownLatch(1);
+        var doneLatch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            Thread.ofVirtual().start(() -> {
+                try { startLatch.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                if (latch.trySet()) successCount.incrementAndGet();
+                doneLatch.countDown();
+            });
+        }
+
+        startLatch.countDown();  // release all threads simultaneously
+        doneLatch.await();
+
+        assert successCount.get() == 1 : "Expected exactly 1 success, got " + successCount.get();
+        assert latch.isSet() : "Latch should be set";
+        System.out.println("All assertions passed. One winner out of " + threadCount + " threads.");
+    }
+}
+```
+
+**Why this works:** `AtomicBoolean.compareAndSet(false, true)` is a single atomic CAS: exactly one thread will observe `false` and successfully write `true`; all others see `true` on their CAS (either because the winner already wrote it, or because they read the updated value) and return `false`. No lock, no synchronization — the CAS itself is the serialization point.
+
+**Common mistake:** Using `if (!set.get()) { set.set(true); return true; }` — this has a TOCTOU race: two threads can both read `false`, then both set `true` and both return `true`. The check-then-act must be atomic, which only CAS provides.
+
+</details>
+
+<details>
+<summary>Exercise 5 — When NOT to use lock-free algorithms</summary>
+
+Three scenarios where blocking locks are better:
+
+1. **Long critical sections with complex state.** Lock-free algorithms work by retrying on CAS failure — if the work inside the "critical section" is expensive (e.g., sorting a list, calling an external service), retrying it on every collision is MORE expensive than holding a lock for the duration. Lock-free is optimal for short, fixed-cost atomic operations.
+
+2. **Low contention or single-threaded contexts.** Lock-free algorithms have higher constant overhead (CAS, volatile reads, retry loop setup) than a simple `synchronized` block on an uncontended monitor. On x86, an uncontended `synchronized` is a few nanoseconds; a CAS loop with bookkeeping can be slower. Use `synchronized` for objects accessed by one or two threads.
+
+3. **Fairness is required.** Lock-free algorithms (including wait-free `AtomicInteger`) give no ordering guarantee — a thread can be starved if other threads keep succeeding their CAS. `ReentrantLock(true)` (fair lock) guarantees FIFO ordering among waiting threads. Use a fair lock for scenarios like task schedulers, rate limiters, or any system where starvation is unacceptable.
+
+**Staff-level phrasing:** "Avoid lock-free when: (1) the protected operation is long-running — CAS retry multiplies cost under contention; (2) contention is low — uncontended `synchronized` is faster than CAS overhead; (3) fairness/FIFO ordering is required — CAS gives no ordering guarantee, use `ReentrantLock(fair=true)`."
+
+</details>
+
+---
+
 ## 9. Summary / Flashcard
 
 - **CAS is the CPU primitive for lock-free**: atomically compare-then-swap; if contention causes failure, the retry loop ensures at least one thread always makes progress — this is the definition of lock-free

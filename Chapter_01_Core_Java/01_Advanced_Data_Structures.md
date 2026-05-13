@@ -310,6 +310,115 @@ or cap Map size + reject oversized inputs at boundary
 
 ---
 
+## Exercise Solutions
+
+<details>
+<summary>Exercise 1 — TLAB allocation for humongous objects</summary>
+
+When an object is larger than the TLAB size (typically ~1% of Eden, around 512 KB by default), it cannot fit in the current TLAB and the JVM bypasses the TLAB entirely. For G1GC, objects larger than 50% of a G1 region (default region = 1 MB, so objects > 512 KB) are classified as "humongous" and allocated directly in dedicated humongous regions in the old generation, skipping Eden entirely. This triggers a concurrent marking check and can cause a premature GC cycle. You can observe TLAB statistics with `-XX:+PrintTLAB` (or `-Xlog:gc+tlab=trace` in modern JVMs), which prints per-thread allocation rates, refill counts, and waste. The practical implication is that allocating many large objects in a tight loop is significantly more expensive than allocating many small objects — each large allocation may trigger a GC cycle whereas small allocations live and die in TLAB with zero GC interaction.
+
+**Staff-level phrasing:** "Objects exceeding the TLAB size bypass the fast-path pointer-bump and allocate directly in humongous/old-gen regions, triggering a concurrent GC check on every allocation — design domain objects to stay well below the TLAB threshold."
+
+</details>
+
+<details>
+<summary>Exercise 2 — Power-of-two array sizes and bitwise wrap</summary>
+
+`ArrayDeque` and `HashMap` require array lengths to be powers of two so that the expensive modulo operation `(index + 1) % length` can be replaced with the single-instruction bitwise AND `(index + 1) & (length - 1)`. This works because any power of two `N` has exactly one bit set, making `N - 1` a bitmask of all 1s in the lower bits. For an array of size 16 (`10000` in binary), `length - 1 = 15 = 01111`. So `(index + 1) & 15` clamps any index value to the range `[0, 15]` with a single AND instruction rather than a division. For example: index 15 → `(15 + 1) & 15 = 16 & 15 = 0` (wraps to start). Modulo (`%`) requires a division unit and costs roughly 3 CPU cycles versus 1 cycle for AND.
+
+**Staff-level phrasing:** "Power-of-two array sizes turn circular-buffer wraparound from a 3-cycle integer division into a 1-cycle bitwise AND — this is the foundational micro-optimization shared by every JDK collection that uses a ring buffer."
+
+</details>
+
+<details>
+<summary>Exercise 3 — Cache miss cost in instruction equivalents</summary>
+
+At 4 GHz, one CPU cycle = 0.25 ns. An L3 cache miss costs ~40 cycles = 10 ns, equivalent to 160 instructions (at 4 IPC). A RAM access costs ~100 ns = 400 cycles = 1,600 instructions. This means that one pointer dereference that misses L3 burns as many cycles as 1,600 simple arithmetic instructions — the ratio is roughly 400:1. For pointer-chasing linked data structures like `LinkedList`, traversing N nodes requires N sequential pointer dereferences, and each node pointer is likely in a different cache line (16-byte header + pointer layout = poor spatial locality). A traversal of a 10,000-element `LinkedList` may incur 10,000 cache misses while the equivalent `ArrayList` traversal hits the cache once per 8 elements (64-byte cache line / 8-byte references). This is the physical reason to prefer `ArrayDeque` over `LinkedList` for any performance-sensitive path.
+
+**Staff-level phrasing:** "One pointer dereference that misses L3 cache is worth 400+ arithmetic instructions — pointer-chasing linked structures are a CPU performance cliff, and sequential array-backed structures exist precisely to exploit cache-line spatial locality."
+
+</details>
+
+<details>
+<summary>Exercise 4 — Coding challenge: 4-cell LongAdder-style counter</summary>
+
+```java
+// Reference implementation (Java 21+, compilable standalone)
+import jdk.internal.vm.annotation.Contended;
+import org.openjdk.jmh.annotations.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+// --- Counter implementation ---
+public class FourCellCounter {
+
+    // Each Cell padded to its own cache line with @Contended
+    // Requires JVM flag: -XX:-RestrictContended (or use jdk.internal module)
+    @Contended
+    static final class Cell {
+        volatile long value;
+        Cell(long v) { value = v; }
+    }
+
+    private final Cell[] cells = {
+        new Cell(0), new Cell(0), new Cell(0), new Cell(0)
+    };
+
+    // Each thread maps to a cell by thread ID mod 4
+    public void increment() {
+        int idx = (int)(Thread.currentThread().threadId() & 3);
+        cells[idx].value++;  // not atomic — for low-contention per-cell increment
+    }
+
+    public long sum() {
+        long total = 0;
+        for (Cell c : cells) total += c.value;
+        return total;
+    }
+}
+
+// --- JMH Benchmark ---
+@BenchmarkMode(Mode.Throughput)
+@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@State(Scope.Benchmark)
+@Warmup(iterations = 3, time = 1)
+@Measurement(iterations = 5, time = 1)
+@Fork(1)
+@Threads(4)
+public class CounterBenchmark {
+
+    private final AtomicLong atomicLong = new AtomicLong(0);
+    private final FourCellCounter cellCounter = new FourCellCounter();
+
+    @Benchmark
+    public void atomicLongIncrement() {
+        atomicLong.incrementAndGet();
+    }
+
+    @Benchmark
+    public void fourCellIncrement() {
+        cellCounter.increment();
+    }
+}
+```
+
+**Why this works:** Each `Cell` is padded by `@Contended` to occupy its own 64-byte (plus padding) cache line, so a write to `cells[0].value` never invalidates the cache line containing `cells[1].value` on another core. The 4 threads each hit a private cell, eliminating cross-core cache invalidation storms. The `sum()` merge happens infrequently (read path), so the occasional cross-core read is acceptable.
+
+**Common mistake:** Placing all four `long` counters directly as fields in one class without `@Contended` — they land on the same or adjacent cache lines, causing false sharing that makes the 4-cell counter slower than `AtomicLong` under contention, not faster.
+
+</details>
+
+<details>
+<summary>Exercise 5 — TLAB refill_waste threshold</summary>
+
+The `refill_waste` threshold (configurable via `-XX:TLABRefillWasteFraction`, default = 64) defines how much of a TLAB may remain unused before the JVM prefers abandoning it to allocating a fresh TLAB rather than doing a slow-path allocation for a large object. Specifically, if the remaining TLAB space is less than `current_tlab_size / refill_waste_fraction`, the JVM will retire the current TLAB and allocate a new one rather than attempting a bump into the old one. This prevents excessive waste from many small "leftover" gaps that would collectively fragment Eden without serving future allocations. With `-XX:+PrintTLAB` (or `-Xlog:gc+tlab=trace`), each TLAB retirement prints the thread, the TLAB size, the number of slow allocations, and the total wasted bytes — high waste percentages indicate that objects are being allocated in sizes poorly matched to the TLAB size, suggesting you should tune `-XX:TLABSize` or reduce per-object size.
+
+**Staff-level phrasing:** "The TLAB `refill_waste` threshold determines when it is cheaper to retire a partially-used TLAB and allocate a fresh one than to waste its remaining space on an oversized object — monitor with `-Xlog:gc+tlab=trace` and tune `-XX:TLABSize` if waste exceeds ~5% of total Eden allocation."
+
+</details>
+
+---
+
 ## 8. Summary / Flashcard
 
 - **TLAB makes object allocation lock-free**: each thread gets a private Eden slice; allocation = pointer bump at ~0.5 ns; only the rare TLAB refill (once per ~1MB) touches shared state

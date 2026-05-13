@@ -570,6 +570,142 @@ flag = 1;           System.out.println(x);  // What does this print?
 
 ---
 
+## Exercise Solutions
+
+<details>
+<summary>Exercise 1 — volatile: sufficient for stop flag, insufficient for counter</summary>
+
+`volatile` provides two guarantees: **visibility** (a write is immediately flushed to main memory, subsequent reads see the new value) and **ordering** (writes/reads cannot be reordered across the volatile variable). It does NOT provide **atomicity** for compound operations.
+
+A **stop flag** (`volatile boolean stopped`) needs only visibility: Thread A writes `stopped = true`, Thread B reads `stopped` and sees `true`. This is a single atomic write followed by a single atomic read — no compound operation involved. `volatile` is exactly sufficient.
+
+A **counter** (`volatile int count; count++`) is a compound operation: read current value, increment, write new value. With two threads both executing `count++` concurrently: both may read the same value `42`, both increment to `43`, both write `43`. The result is `43` instead of the correct `44`. The read-increment-write sequence is not atomic even with `volatile`. Use `AtomicInteger.incrementAndGet()` which uses a CAS loop to make the entire operation atomic.
+
+**Staff-level phrasing:** "`volatile` provides visibility + ordering, not atomicity; `stopped = true` is a single atomic write so `volatile` suffices; `count++` is read-modify-write requiring CAS via `AtomicInteger` — mixing up these two cases is one of the most common JMM bugs in production."
+
+</details>
+
+<details>
+<summary>Exercise 2 — Happens-before relationships in the flag example</summary>
+
+```java
+int x = 0;
+volatile int flag = 0;
+// Thread A:         // Thread B:
+x = 42;             while (flag == 0) {}
+flag = 1;           System.out.println(x);
+```
+
+Happens-before relationships:
+1. `x = 42` **HB** `flag = 1` — program order rule within Thread A
+2. `flag = 1` (write) **HB** `while(flag == 0)` exit (read that observes the write) — volatile write HB subsequent volatile read
+3. By transitivity: `x = 42` **HB** `System.out.println(x)`
+
+**Result:** Thread B prints **42** — guaranteed. The volatile write to `flag` establishes a happens-before edge that carries all preceding writes in Thread A (including `x = 42`) to Thread B. This is the canonical pattern for safe publication via `volatile`.
+
+**Staff-level phrasing:** "Volatile write-to-read establishes HB; by transitivity all Thread A writes before `flag=1` are visible to Thread B after it reads `flag==1` — result is deterministically 42, not a data race."
+
+</details>
+
+<details>
+<summary>Exercise 3 — HashMap in multi-threaded app with mostly reads</summary>
+
+The claim is wrong. `HashMap` is not safe under any concurrent use, regardless of read/write ratio.
+
+The specific danger: a `HashMap.put()` that triggers a **resize** (`rehash`) restructures the internal array while readers are iterating buckets. A reader can:
+- Follow a `next` pointer into a **cycle** (infinite loop — historically from Java 6 resize, fixed in Java 8's tree-ification of long chains, but still possible with corrupt state)
+- Observe a partially-written entry and read `null` from a non-null key
+- Miss a key that was fully inserted before the current thread started
+
+The "mostly reads" heuristic is dangerous: even one concurrent write invalidates all concurrent reads without synchronization.
+
+**Correct solutions:**
+- Read-heavy, write-rare: `ConcurrentHashMap` (lock-striped, readers never block, O(1) per segment)
+- Read-only after construction: plain `HashMap` wrapped in `Collections.unmodifiableMap()`, accessed after a safe publication guarantee (e.g., `final` field or `volatile`)
+- Never: `Collections.synchronizedMap()` for high-concurrency — coarse lock serializes all access
+
+**Staff-level phrasing:** "Any concurrent write to `HashMap` — even one — can corrupt the structure for all concurrent readers; use `ConcurrentHashMap` which provides lock-free reads via `volatile` array slots and CAS-based writes."
+
+</details>
+
+<details>
+<summary>Exercise 4 — Coding challenge: volatile-only lazy-init cache</summary>
+
+```java
+// Reference implementation (Java 21+, compilable standalone)
+import java.util.concurrent.*;
+import java.util.function.*;
+
+public class VolatileCache<T> {
+    private volatile T value;
+    private final Supplier<T> supplier;
+
+    public VolatileCache(Supplier<T> supplier) {
+        this.supplier = supplier;
+    }
+
+    public T get() {
+        T v = value;                  // read once from volatile field
+        if (v == null) {
+            synchronized (this) {     // only one thread initializes
+                v = value;            // re-read under lock
+                if (v == null) {
+                    v = supplier.get();
+                    value = v;        // volatile write — publishes to all threads
+                }
+            }
+        }
+        return v;
+    }
+
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        var counter = new java.util.concurrent.atomic.AtomicInteger(0);
+        var cache = new VolatileCache<>(() -> {
+            counter.incrementAndGet();
+            return "computed";
+        });
+
+        int threads = 100;
+        var latch = new CountDownLatch(threads);
+        var results = new java.util.concurrent.CopyOnWriteArrayList<String>();
+
+        for (int i = 0; i < threads; i++) {
+            Thread.ofVirtual().start(() -> {
+                results.add(cache.get());
+                latch.countDown();
+            });
+        }
+        latch.await();
+
+        assert counter.get() == 1 : "Supplier called " + counter.get() + " times, expected 1";
+        assert results.stream().allMatch("computed"::equals) : "Some thread got wrong value";
+        System.out.println("All assertions passed. Supplier called: " + counter.get());
+    }
+}
+```
+
+**Why this works:** This is the **double-checked locking** (DCL) pattern. The `volatile` read on the fast path avoids synchronization after initialization. The `synchronized` block ensures only one thread computes the value. The re-check inside the lock handles the race where two threads both saw `null` before synchronizing. The `volatile` write to `value` ensures the constructed object is **safely published** — all threads see a fully initialized object, not a partially constructed one (critical: without `volatile`, the JIT could reorder the write to `value` before the constructor completes).
+
+**Common mistake:** Implementing DCL without `volatile` — `private T value` without volatile allows the JIT to cache the field in a register or reorder construction, making it possible for another thread to see a non-null but partially initialized object.
+
+</details>
+
+<details>
+<summary>Exercise 5 — x86 TSO vs ARM: AtomicInteger cost difference</summary>
+
+**x86 TSO (Total Store Order):** x86 has a very strong memory model. Every store is immediately visible to other cores (there is a store buffer, but stores are written through to the coherence protocol in order). `AtomicInteger.incrementAndGet()` on x86 compiles to a single `LOCK XADD` instruction — the `LOCK` prefix makes the read-modify-write atomic at the hardware level. There is NO additional memory barrier needed because x86 loads already have acquire semantics and stores have release semantics by default.
+
+A plain `volatile` write on x86 emits a `SFENCE` (store fence) or `MFENCE` (full fence) which is MORE expensive than `LOCK XADD` — because the fence stalls the entire store buffer whereas `LOCK XADD` only serializes one address.
+
+**ARM (Weak Memory Model):** ARM allows loads and stores to be reordered freely. `AtomicInteger.incrementAndGet()` on ARM requires: a `LDADD` (load-acquire-add) instruction plus a `STLR` (store-release) — or a CAS loop using `LDAXR`/`STLXR` with full barrier semantics. Both acquire and release barriers are explicitly emitted. A plain `volatile` write on ARM also requires only a `STLR` (store-release) — so a `volatile` write is cheaper or similar cost to an atomic increment on ARM, unlike on x86.
+
+**Staff-level phrasing:** "On x86 TSO, `LOCK XADD` for atomic increment is cheaper than a full `MFENCE` volatile write because x86 already has strong ordering — no separate fence needed; on ARM's weak model, atomic increment requires explicit acquire+release barriers, matching or exceeding the cost of a volatile write."
+
+</details>
+
+---
+
 ## 8. Summary / Flashcard
 
 - **JMM exists because CPUs cache and reorder**: without barriers, threads see stale values from private L1 caches; `volatile` forces cache flush and disables reordering via hardware fences

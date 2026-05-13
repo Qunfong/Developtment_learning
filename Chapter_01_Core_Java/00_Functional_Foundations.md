@@ -338,6 +338,121 @@ public record Payment(String type, String cardNumber, String cryptoAddress) {}
 
 ---
 
+## Exercise Solutions
+
+<details>
+<summary>Exercise 1 — Illegal state elimination with sealed interfaces</summary>
+
+The `Payment` record has a `String type` (2 states: "CARD" or "CRYPTO"), `String cardNumber` (N+1 states including null), and `String cryptoAddress` (N+1 states including null). As a Product Type, the total state space is enormous and allows illegal combinations such as a CRYPTO payment with a non-null `cardNumber`. The refactored sealed hierarchy makes those combinations unrepresentable:
+
+```java
+public sealed interface Payment permits Payment.Card, Payment.Crypto {}
+
+public record Card(String cardNumber) implements Payment {}
+public record Crypto(String cryptoAddress) implements Payment {}
+```
+
+Now a `Card` can never have a `cryptoAddress` and vice versa — the compiler enforces this at every call site, and the state space collapses from millions of illegal combinations to exactly the set of legal values.
+
+**Staff-level phrasing:** "Replace Product Types that encode mutual exclusion with Sum Types — sealed interfaces collapse illegal state combinations to zero at compile time, eliminating an entire category of runtime bugs."
+
+</details>
+
+<details>
+<summary>Exercise 2 — Optional and Serializable</summary>
+
+`Optional` does not implement `java.io.Serializable`. If you place it as a field in a `Serializable` class, the serialization framework will throw `NotSerializableException` at runtime when that field is non-empty, because the `Optional` instance itself must be serialized along with the enclosing object. The OpenJDK source explicitly omits `implements Serializable` to discourage using `Optional` as a persistent value holder — it was designed purely as a method return type for expressing "the result may be absent." The correct pattern is to store the nullable value directly and reconstruct the `Optional` on access via a getter.
+
+**Staff-level phrasing:** "`Optional` intentionally does not implement `Serializable`; using it as a field in a serializable class is an API design error — store the raw nullable value and wrap it in `Optional` only at the API boundary."
+
+</details>
+
+<details>
+<summary>Exercise 3 — Type algebra cardinality</summary>
+
+A `boolean` has exactly 2 inhabitants (`true` and `false`), so its cardinality is 2. An `enum Color { RED, GREEN, BLUE }` has exactly 3 inhabitants, so its cardinality is 3. `Optional<Boolean>` is a Sum Type equivalent to `Some(Boolean) + Nothing`, which has cardinality 2 + 1 = 3: `Optional.of(true)`, `Optional.of(false)`, and `Optional.empty()`. The key insight is that Sum Types add cardinalities while Product Types multiply them — this is why replacing a nullable boolean field (which has 3 states: `true`, `false`, and `null`, but is modelled as a Product Type by the JVM) with `Optional<Boolean>` is cardinality-neutral but contracts the legal-state surface explicitly.
+
+**Staff-level phrasing:** "`boolean` = 2, `enum Color{RED,GREEN,BLUE}` = 3, `Optional<Boolean>` = 3 — Sum Types add cardinalities; use this arithmetic to prove that a refactoring to sealed types cannot introduce new illegal states."
+
+</details>
+
+<details>
+<summary>Exercise 4 — Coding challenge: Result with recover</summary>
+
+```java
+// Reference implementation (Java 21+, compilable standalone)
+import java.util.function.Function;
+
+public sealed interface Result<V, E> permits Result.Success, Result.Failure {
+
+    record Success<V, E>(V value) implements Result<V, E> {}
+    record Failure<V, E>(E error) implements Result<V, E> {}
+
+    static <V, E> Result<V, E> success(V value) { return new Success<>(value); }
+    static <V, E> Result<V, E> failure(E error)  { return new Failure<>(error); }
+
+    @SuppressWarnings("unchecked")
+    default <U> Result<U, E> flatMap(Function<V, Result<U, E>> mapper) {
+        return switch (this) {
+            case Success<V, E> s -> mapper.apply(s.value());
+            case Failure<V, E> f -> (Result<U, E>) f;
+        };
+    }
+
+    // recover: if Failure, apply fn to produce a Success; if already Success, no-op
+    default Result<V, E> recover(Function<E, V> fn) {
+        return switch (this) {
+            case Success<V, E> s -> s;
+            case Failure<V, E> f -> {
+                try {
+                    yield success(fn.apply(f.error()));
+                } catch (Exception ex) {
+                    // recovery function itself threw — wrap as new failure
+                    // Note: requires E to accept Throwable or use a separate error type
+                    yield (Result<V, E>) failure(ex); // unchecked: E must be compatible
+                }
+            }
+        };
+    }
+
+    // Tests (main method for standalone verification)
+    static void main(String[] args) {
+        // success recovery (no-op)
+        Result<String, String> s = Result.<String, String>success("ok").recover(e -> "recovered");
+        assert s instanceof Success && ((Success<?,?>) s).value().equals("ok") : "no-op failed";
+
+        // failure recovery
+        Result<String, String> r = Result.<String, String>failure("err").recover(e -> "recovered");
+        assert r instanceof Success && ((Success<?,?>) r).value().equals("recovered") : "recovery failed";
+
+        // recovery that throws — becomes failure
+        Result<String, ?> t = Result.<String, String>failure("err").recover(e -> {
+            throw new RuntimeException("recovery exploded");
+        });
+        assert t instanceof Failure : "throwing recovery must produce failure";
+
+        System.out.println("All assertions passed.");
+    }
+}
+```
+
+**Why this works:** The `recover` method pattern-matches on `Failure` only, wraps the recovery function in a try/catch, and yields `success(fn.apply(...))` on the happy path — making the no-op case for `Success` explicit and zero-overhead. The catching of `Exception` inside the `Failure` branch is the key difference from a naive implementation that would let the recovery exception escape.
+
+**Common mistake:** Implementing `recover` as a plain `map` on the error channel using `flatMap` without the try/catch means a throwing recovery function propagates an unchecked exception to the caller instead of turning it into a `Failure` — breaking the contract that the return type models all outcomes.
+
+</details>
+
+<details>
+<summary>Exercise 5 — Loop Fusion in Java Streams</summary>
+
+The JVM does NOT iterate the list three times. Java Streams use **lazy evaluation** — no intermediate operation executes until a terminal operation (like `collect()`) is called. When the pipeline fires, `AbstractPipeline.evaluate()` builds a chain of `Sink` objects (one per operation) and then drives a single pass through the source `Spliterator`, pushing each element through the full chain: `filter → map → collect` in one iteration. This is called **operation fusion**: the filter's output is handed directly to the map's input without materializing an intermediate collection. Short-circuit terminals like `findFirst()` can stop this single pass early. The only operations that break fusion are stateful intermediates like `sorted()`, which must materialize all elements before proceeding.
+
+**Staff-level phrasing:** "A Stream pipeline with `filter + map + collect` performs exactly one iteration — `AbstractPipeline.evaluate()` fuses all stateless operations into a single `Sink` chain driven by one `Spliterator.forEachRemaining()` call; only stateful operations like `sorted()` force a full materialization break."
+
+</details>
+
+---
+
 ## 7. Summary / Flashcard
 
 - **Product types multiply state space, Sum types add it**: a record with 3 boolean fields has 8 possible states; a sealed interface with 3 subtypes has exactly 3 — use Sum types to make illegal states unrepresentable at the type level

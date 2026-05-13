@@ -302,6 +302,57 @@ After record field reordering: saved 1.5GB alignment padding = ~$150/month
 
 ---
 
+## GOL Challenge (v0)
+
+> **System:** [Global Order Ledger](../GOL_ARCHITECTURE.md) | **Version:** v0 — Domain Model Bootstrap
+> 
+> This is the first GOL challenge. There are no previous GOL versions to build on — you are starting from scratch.
+
+### Context
+
+The Global Order Ledger processes 50,000 financial transactions per second across 3 global regions. Your task: model the core domain events using the Java 21+ features covered in this module.
+
+### Task
+
+**1. Design the sealed LedgerEvent hierarchy**
+
+```java
+// Implement this sealed interface hierarchy:
+// - LedgerEvent (sealed interface)
+// - Debit implements LedgerEvent (record)
+// - Credit implements LedgerEvent (record)  
+// - Transfer implements LedgerEvent (record)
+//
+// Each event must carry: accountId, amount (BigDecimal), 
+// timestamp (Instant), idempotencyKey (String)
+// Transfer additionally carries: toAccountId
+```
+
+**2. Implement a `LedgerEventProcessor` using switch expressions**
+
+```java
+// Using pattern matching switch (Java 21):
+// - Debit: deduct amount, return new balance
+// - Credit: add amount, return new balance
+// - Transfer: return a Pair<BigDecimal, BigDecimal> (fromBalance, toBalance)
+// - Use guard patterns to reject negative amounts
+```
+
+**3. Explain in one sentence**: why `sealed` is better than an open class hierarchy for domain events in a financial ledger.
+
+### Expected Outcome
+
+- Compile-clean Java 21+ code
+- No `instanceof` checks — use pattern matching switch exhaustively
+- `Transfer` implements `LedgerEvent` with `accountId()` returning `fromAccountId`
+- The `idempotencyKey` prevents double-processing: same key = same event applied once
+
+### Next GOL Challenge
+
+v0.5 — Async validation with CompletableFuture (Ch 1.7)
+
+---
+
 ## 8. Exercises
 
 **1.** Why is a runtime-generated `invokedynamic` jump table superior to a compile-time `if-else` chain for a microservice fleet that loads hot-swappable plugins? (Hint: consider what happens when a new `OrderState` subtype is deployed without recompiling the switch logic.)
@@ -313,6 +364,126 @@ After record field reordering: saved 1.5GB alignment padding = ~$150/month
 **4. Coding challenge:** Implement a `Gatherer<Order, ?, Order>` that deduplicates consecutive orders with the same `customerId` — if two adjacent orders have the same customer, only emit the first. Write a stream test that verifies the behavior.
 
 **5.** How do Record Patterns (`case Settled(Instant t, String id)`) achieve faster field access than traditional `case Settled s -> s.settledAt()`? Examine the bytecode with `javap -c`.
+
+---
+
+## Exercise Solutions
+
+<details>
+<summary>Exercise 1 — invokedynamic vs if-else for hot-swappable plugins</summary>
+
+An `if-else` chain compiled against known subtypes is a static sequence of `instanceof` checks baked into bytecode. When a new `OrderState` subtype is deployed at runtime, the old bytecode has no branch for it — behavior is silently wrong (falls through to the default) and a full redeploy is required to add the branch.
+
+`invokedynamic` compiles the switch to a `CallSite` backed by a `MethodHandle` table. The JVM bootstraps the dispatch table on first call and caches it. When a new subtype is loaded, the `MutableCallSite` can be invalidated and re-linked to include the new branch — without recompiling the calling class. The JIT deoptimizes and recompiles, but the logical dispatch becomes O(1) again. More importantly, the compiler enforces exhaustiveness on sealed hierarchies: a missing `case` is a compile error, preventing silent wrong behavior.
+
+**Staff-level phrasing:** "`invokedynamic` lets the JVM re-link dispatch tables at runtime for new subtypes without recompiling callers, while a static `instanceof` chain silently ignores unknown subtypes — sealed `switch` + `invokedynamic` gives both compile-time exhaustiveness checking and runtime extensibility."
+
+</details>
+
+<details>
+<summary>Exercise 2 — Mark Word and value objects in Project Valhalla</summary>
+
+Every Java object today has an 8-byte **Mark Word** in its header that stores: identity hash code (31 bits), GC age bits, lock state (biased/thin/fat lock), and a GC forwarding pointer during relocation. Identity (`==`) comparison works by comparing object addresses — two distinct `new Object()` instances at different addresses are never `==`.
+
+Value objects (Project Valhalla `value record`) have no identity: they behave like primitives — two instances with identical fields ARE equal. Because value objects have no identity, there is no reference to compare, and therefore no address to store. Without an address there is no need for the lock bits (value objects can't be `synchronized` on) or the identity hash code (there is no identity to hash). The Mark Word becomes unnecessary, so the JVM can remove the entire 12-16 byte header and store value objects as flat, contiguous field data in arrays. This is what enables the "no pointer chase" performance gain.
+
+**Staff-level phrasing:** "The Mark Word encodes object identity (hash, lock, GC metadata); value objects have no identity by definition, so the Mark Word — and the entire object header — can be eliminated, enabling flat array storage with zero pointer indirection."
+
+</details>
+
+<details>
+<summary>Exercise 3 — JOL field ordering and alignment padding</summary>
+
+JVM aligns each field to its own size boundary and aligns the object total size to 8 bytes. For `byte, long, byte`:
+- offset 12: `byte` (1 byte)
+- padding 5 bytes (to align `long` to 8-byte boundary)
+- offset 16: `long` (8 bytes)
+- offset 24: `byte` (1 byte)
+- padding 7 bytes (to pad object to 8-byte boundary)
+- **Total: 32 bytes**
+
+For `long, byte, byte`:
+- offset 12: `long` (8 bytes)
+- offset 20: `byte` (1 byte)
+- offset 21: `byte` (1 byte)
+- padding 2 bytes (to pad object to 8-byte boundary)
+- **Total: 24 bytes**
+
+Saving: 8 bytes (25%) per instance — for 100M cached instances that is 800MB. JVM field reordering is allowed but not guaranteed; JOL shows the actual layout. The lesson: declare larger fields first when memory density matters.
+
+**Staff-level phrasing:** "Field declaration order in source controls layout only when the JVM doesn't reorder (hotspot usually does, but not always) — always validate with JOL before assuming savings; `long, byte, byte` is 24 bytes vs `byte, long, byte` at 32 bytes due to alignment padding."
+
+</details>
+
+<details>
+<summary>Exercise 4 — Coding challenge: Gatherer deduplicating consecutive orders by customerId</summary>
+
+```java
+// Reference implementation (Java 21+, compilable standalone)
+import java.util.List;
+import java.util.stream.Gatherer;
+
+public class DeduplicateConsecutive {
+
+    public static Gatherer<Order, ?, Order> byCustomerId() {
+        return Gatherer.ofSequential(
+            () -> new String[1],   // state: last seen customerId (mutable box)
+            (state, element, downstream) -> {
+                if (!element.customerId().equals(state[0])) {
+                    state[0] = element.customerId();
+                    downstream.push(element);
+                }
+                return true;
+            }
+        );
+    }
+
+    record Order(String customerId, String itemId) {}
+
+    public static void main(String[] args) {
+        var orders = List.of(
+            new Order("A", "item1"),
+            new Order("A", "item2"),  // duplicate consecutive — skip
+            new Order("B", "item3"),
+            new Order("A", "item4"),  // not consecutive — keep
+            new Order("B", "item5"),
+            new Order("B", "item6")   // duplicate consecutive — skip
+        );
+
+        var result = orders.stream()
+            .gather(byCustomerId())
+            .toList();
+
+        assert result.size() == 4 : "Expected 4 but got " + result.size();
+        assert result.get(0).customerId().equals("A");
+        assert result.get(1).customerId().equals("B");
+        assert result.get(2).customerId().equals("A");
+        assert result.get(3).customerId().equals("B");
+        System.out.println("All assertions passed. Result: " + result);
+    }
+}
+```
+
+**Why this works:** `Gatherer.ofSequential` with a mutable state array lets us track the last emitted `customerId`. The integrator pushes the element downstream only when the current customer differs from the previous one. Using `String[1]` (a mutable box) as state avoids needing a wrapper class while keeping the lambda non-capturing-but-mutable.
+
+**Common mistake:** Using `Gatherer.of()` (the parallel variant) without a combiner, which causes incorrect deduplication in parallel mode — consecutive-duplicate removal is inherently sequential because "consecutive" is defined by stream order. Always use `Gatherer.ofSequential()` for order-dependent stateful operations.
+
+</details>
+
+<details>
+<summary>Exercise 5 — Record Patterns vs accessor calls in bytecode</summary>
+
+With `case Settled s -> s.settledAt()`, the bytecode must:
+1. Cast the object reference to `Settled` (`checkcast`)
+2. Invoke the accessor method `settledAt()` (virtual `invokevirtual`)
+
+With `case Settled(Instant t, String id)`, the compiler generates a pattern matching bootstrap that extracts the record components via the record's component accessor methods, but with a key difference: the JVM's `invokedynamic` pattern-matching intrinsic can short-circuit the `checkcast` (it was already checked by the switch dispatch) and the JIT can inline the accessor trivially because record components are final and their accessor bodies are trivially `return field`. In practice the JIT eliminates both the virtual dispatch overhead and the redundant type check, reducing to a direct field load.
+
+Running `javap -c` on the compiled switch shows the `case Settled s -> s.settledAt()` variant has an extra `checkcast` + `invokevirtual` for the accessor, while the Record Pattern variant shows the `invokedynamic` bootstrap that the JIT collapses into a direct `getfield` after inlining.
+
+**Staff-level phrasing:** "Record Patterns let the JIT collapse the cast + virtual dispatch into a direct `getfield` after inlining — the `invokedynamic` bootstrap at the switch level already proved the type, so the component extraction has zero runtime type-check overhead."
+
+</details>
 
 ---
 
